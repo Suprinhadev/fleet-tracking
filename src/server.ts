@@ -107,12 +107,18 @@ app.post("/api/alerts/:eventId/ack", requireUser, async (req, res) => {
 });
 
 const socketUrl = `${config.traccarUrl.replace(/^http/, "ws")}/api/socket`;
+
+app.listen(config.port, "0.0.0.0", () => {
+  console.log(`Fleet API listening on port ${config.port}`);
+});
+
 void connectTraccarSocket(traccar, socketUrl, async (message) => {
   if (message.events?.length) {
     await alertStore.createFromEvents(message.events);
   }
-});
-
-app.listen(config.port, "0.0.0.0", () => {
-  console.log(`Fleet API listening on port ${config.port}`);
+}).catch((error) => {
+  console.error(
+    "Traccar WebSocket unavailable; REST API remains active:",
+    error.message,
+  );
 });
