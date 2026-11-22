@@ -15,7 +15,14 @@ app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || config.corsOrigins.includes(origin)) callback(null, true);
+      const localPreview = /^http:\/\/localhost:\d+$/.test(origin || "");
+      const vercelPreview = /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin || "");
+      if (
+        !origin ||
+        localPreview ||
+        vercelPreview ||
+        config.corsOrigins.includes(origin)
+      ) callback(null, true);
       else callback(new Error("Origin is not allowed"));
     },
   }),
