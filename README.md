@@ -20,6 +20,19 @@ Apply `supabase/migrations/001_tracker_positions.sql` in the Supabase SQL editor
 Copy `.env.example` to `.env.local` and fill the real server-only values.
 Never expose `TRACCAR_PASSWORD` or `SUPABASE_SERVICE_ROLE_KEY` in frontend code.
 
+## Responsive fleet frontend
+
+The Next.js frontend is under `web/`. It provides:
+
+- Supabase email/password login.
+- Live positions with a ten-second refresh.
+- A responsive OpenStreetMap view.
+- Fleet list and vehicle status cards.
+- Desktop and mobile navigation.
+
+Copy `web/.env.example` to `web/.env.local` before running it. Use only the
+Supabase public URL and anon key in the frontend; never add the service-role key.
+
 Starter setup for testing an A16 BLE vehicle tracker with Traccar and PostgreSQL.
 This project does not contain a server address, real credentials, or an exposed
 device port. Nothing is deployed by this repository.
