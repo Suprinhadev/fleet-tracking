@@ -125,8 +125,11 @@ export default function Dashboard() {
       <main className="login-shell">
         <section className="login-brand">
           <div className="brand-logo compact">
-            <span className="brand-mark">Ai</span>
-            <span className="brand-name">Connect</span>
+            <img
+              src="/ai-connect-logo.png"
+              alt="Ai Connect"
+              className="brand-logo-image"
+            />
           </div>
           <p>Gestao inteligente de veiculos</p>
         </section>
@@ -170,15 +173,30 @@ export default function Dashboard() {
   const latitude = selectedPosition?.latitude || -25.867148888888888;
   const longitude = selectedPosition?.longitude || 32.5478;
   const speed = selectedPosition?.speed || 0;
-  const isMoving = speed > 1;
+  const positionAgeMinutes = selectedPosition
+    ? (Date.now() - new Date(selectedPosition.fixTime).getTime()) / 60000
+    : null;
+  const hasRecentPosition =
+    positionAgeMinutes !== null && positionAgeMinutes >= 0 && positionAgeMinutes <= 10;
+  const isMoving = hasRecentPosition && speed > 1;
+  const movementLabel = !selectedPosition
+    ? "Sem dados"
+    : !hasRecentPosition
+      ? "Dados antigos"
+      : isMoving
+        ? "Em movimento"
+        : "Parado";
 
   return (
     <div className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
         <div className="sidebar-head">
           <div className="brand-logo">
-            <span className="brand-mark">Ai</span>
-            <span className="brand-name">Connect</span>
+            <img
+              src="/ai-connect-logo.png"
+              alt="Ai Connect"
+              className="brand-logo-image"
+            />
           </div>
           <button className="icon-button close-sidebar" onClick={() => setSidebarOpen(false)}>
             <X size={18} />
@@ -241,7 +259,7 @@ export default function Dashboard() {
             </article>
             <article>
               <div className="metric-icon green"><Activity size={18} /></div>
-              <div><span>Em movimento</span><strong>{isMoving ? 1 : 0}</strong></div>
+              <div><span>Estado</span><strong>{movementLabel}</strong></div>
             </article>
             <article>
               <div className="metric-icon amber"><CircleGauge size={18} /></div>
@@ -249,7 +267,7 @@ export default function Dashboard() {
             </article>
             <article>
               <div className="metric-icon navy"><ShieldCheck size={18} /></div>
-              <div><span>Conectividade</span><strong>Seguro</strong></div>
+              <div><span>Conectividade</span><strong>{hasRecentPosition ? "Seguro" : "Verificar"}</strong></div>
             </article>
           </div>
 
@@ -261,7 +279,7 @@ export default function Dashboard() {
                   <h2>{selectedDevice?.name || "Nenhum veiculo"}</h2>
                 </div>
                 <span className={isMoving ? "status moving" : "status parked"}>
-                  {isMoving ? "Em movimento" : "Parado"}
+                  {movementLabel}
                 </span>
               </div>
               <TrackerMap

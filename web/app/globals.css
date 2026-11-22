@@ -59,6 +59,19 @@ button { cursor: pointer; }
   white-space: nowrap;
 }
 
+.brand-logo-image {
+  display: block;
+  width: auto;
+  max-width: 190px;
+  max-height: 64px;
+  object-fit: contain;
+}
+
+.sidebar .brand-logo-image {
+  max-width: 168px;
+  max-height: 54px;
+}
+
 .brand-mark {
   width: 43px;
   height: 43px;
