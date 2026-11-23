@@ -330,6 +330,11 @@ button { cursor: pointer; }
   box-shadow: 0 0 0 5px rgba(33,163,102,.10);
 }
 
+.live-status span.offline {
+  background: #a7a8af;
+  box-shadow: 0 0 0 5px rgba(167,168,175,.10);
+}
+
 .metrics {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

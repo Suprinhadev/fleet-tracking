@@ -13,7 +13,7 @@ export class TraccarClient {
     };
   }
 
-  async get<T>(path: string, params?: Record<string, string | number>): Promise<T> {
+  async get<T>(path: string, params?: Record<string, string | number | boolean>): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     if (params) {
       for (const [key, value] of Object.entries(params)) {

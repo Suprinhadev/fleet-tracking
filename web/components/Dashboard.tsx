@@ -50,6 +50,8 @@ export default function Dashboard() {
   const [selectedDeviceId, setSelectedDeviceId] = useState<number>();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [search, setSearch] = useState("");
+  const [liveConnected, setLiveConnected] = useState(false);
+  const [dataWarning, setDataWarning] = useState("");
 
   useEffect(() => {
     if (!supabase) {
@@ -63,31 +65,129 @@ export default function Dashboard() {
     if (!supabase || !sessionReady) return;
 
     const load = async () => {
-      const { data: sessionData } = await supabase.auth.getSession();
-      const token = sessionData.session?.access_token;
-      if (!token) return;
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        const token = sessionData.session?.access_token;
+        if (!token) return;
 
-      const baseUrl = process.env.NEXT_PUBLIC_FLEET_API_URL;
-      if (!baseUrl) return;
+        const baseUrl = process.env.NEXT_PUBLIC_FLEET_API_URL;
+        if (!baseUrl) {
+          setDataWarning("API nao configurada.");
+          return;
+        }
 
-      const headers = { Authorization: `Bearer ${token}` };
-      const [deviceResponse, positionResponse] = await Promise.all([
-        fetch(`${baseUrl}/api/devices`, { headers, cache: "no-store" }),
-        fetch(`${baseUrl}/api/positions`, { headers, cache: "no-store" }),
-      ]);
+        const headers = { Authorization: `Bearer ${token}` };
+        const [deviceResponse, positionResponse] = await Promise.all([
+          fetch(`${baseUrl}/api/devices`, { headers, cache: "no-store" }),
+          fetch(`${baseUrl}/api/positions`, { headers, cache: "no-store" }),
+        ]);
 
-      if (!deviceResponse.ok || !positionResponse.ok) return;
+        if (!deviceResponse.ok || !positionResponse.ok) {
+          setDataWarning("Dados indisponiveis no momento.");
+          return;
+        }
 
-      const deviceList = (await deviceResponse.json()) as Device[];
-      const positionList = (await positionResponse.json()) as Position[];
-      setDevices(deviceList);
-      setPositions(positionList);
-      setSelectedDeviceId((current) => current || deviceList[0]?.id);
+        const deviceList = (await deviceResponse.json()) as Device[];
+        const positionList = (await positionResponse.json()) as Position[];
+        setDevices(deviceList);
+        setPositions(positionList);
+        setDataWarning("");
+        setSelectedDeviceId((current) => current || deviceList[0]?.id);
+      } catch {
+        setDataWarning("Falha temporaria ao atualizar dados.");
+      }
     };
 
     void load();
     const interval = window.setInterval(load, 10000);
     return () => window.clearInterval(interval);
+  }, [sessionReady, supabase]);
+
+  useEffect(() => {
+    if (!supabase || !sessionReady) return;
+
+    const controller = new AbortController();
+
+    const connectLive = async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        const token = data.session?.access_token;
+        const baseUrl = process.env.NEXT_PUBLIC_FLEET_API_URL;
+        if (!token || !baseUrl) return;
+
+        const response = await fetch(`${baseUrl}/api/live`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "text/event-stream",
+          },
+          signal: controller.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          setLiveConnected(false);
+          return;
+        }
+
+        setLiveConnected(true);
+        setDataWarning("");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+
+          for (const event of events) {
+            const line = event
+              .split("\n")
+              .find((item) => item.startsWith("data: "));
+            if (!line) continue;
+
+            let message: {
+              devices?: Device[];
+              positions?: Position[];
+              events?: unknown[];
+            };
+            try {
+              message = JSON.parse(line.slice(6));
+            } catch {
+              continue;
+            }
+
+            if (message.devices?.length) {
+              setDevices((current) => {
+                const map = new Map(current.map((device) => [device.id, device]));
+                for (const device of message.devices || []) map.set(device.id, device);
+                return Array.from(map.values());
+              });
+            }
+
+            if (message.positions?.length) {
+              setPositions((current) => {
+                const map = new Map(current.map((position) => [position.id, position]));
+                for (const position of message.positions || []) map.set(position.id, position);
+                return Array.from(map.values())
+                  .sort(
+                    (a, b) =>
+                      new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime(),
+                  )
+                  .slice(0, 100);
+              });
+            }
+          }
+        }
+      } catch {
+        if (!controller.signal.aborted) setLiveConnected(false);
+      }
+    };
+
+    void connectLive();
+    return () => controller.abort();
   }, [sessionReady, supabase]);
 
   async function signIn(event: React.FormEvent) {
@@ -247,8 +347,8 @@ export default function Dashboard() {
               <h1>Visao da frota</h1>
             </div>
             <div className="live-status">
-              <span />
-              Atualizacao ao vivo
+              <span className={liveConnected ? "" : "offline"} />
+              {liveConnected ? "Atualizacao ao vivo" : dataWarning || "Atualizacao por consulta"}
             </div>
           </div>
 

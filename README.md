@@ -9,6 +9,10 @@ The application backend runs on the VPS and exposes a Node.js API:
 - `GET /api/positions`: reads live/current and historical positions from Traccar.
 - `GET /api/reports/route`: reads route history from Traccar.
 - `GET /api/events`: reads Traccar events.
+- `GET /api/reports/trips`: reads Traccar trip records.
+- `GET /api/reports/stops`: reads Traccar stop records.
+- `GET /api/reports/summary`: reads Traccar summary records.
+- `GET /api/live`: server-sent live updates from Traccar.
 - `POST /api/alerts/:eventId/ack`: acknowledges or resolves an application alert.
 
 The backend opens a session-authenticated WebSocket to `/api/socket`. It stores

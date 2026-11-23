@@ -7,6 +7,8 @@ import { requireUser } from "./auth.js";
 import { TraccarClient } from "./traccar/client.js";
 import { connectTraccarSocket } from "./traccar/socket.js";
 import { createAlertStore } from "./supabase/alerts.js";
+import type { LiveMessage } from "./types.js";
+import { addLiveClient, broadcastLive, removeLiveClient } from "./live.js";
 
 const app = express();
 app.disable("x-powered-by");
@@ -93,6 +95,49 @@ app.get("/api/events", requireUser, async (req, res) => {
   }
 });
 
+const reportQuery = z.object({
+  deviceId: z.coerce.number().int().positive(),
+  from: z.string().datetime(),
+  to: z.string().datetime(),
+});
+
+app.get("/api/reports/trips", requireUser, async (req, res) => {
+  const parsed = reportQuery.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json(parsed.error.flatten());
+  try {
+    res.json(await traccar.get("/api/reports/trips", parsed.data));
+  } catch (error) {
+    res.status(502).json({ error: (error as Error).message });
+  }
+});
+
+app.get("/api/reports/stops", requireUser, async (req, res) => {
+  const parsed = reportQuery.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json(parsed.error.flatten());
+  try {
+    res.json(await traccar.get("/api/reports/stops", parsed.data));
+  } catch (error) {
+    res.status(502).json({ error: (error as Error).message });
+  }
+});
+
+app.get("/api/reports/summary", requireUser, async (req, res) => {
+  const parsed = z
+    .object({
+      deviceId: z.coerce.number().int().positive(),
+      from: z.string().datetime(),
+      to: z.string().datetime(),
+      daily: z.coerce.boolean().optional(),
+    })
+    .safeParse(req.query);
+  if (!parsed.success) return res.status(400).json(parsed.error.flatten());
+  try {
+    res.json(await traccar.get("/api/reports/summary", parsed.data));
+  } catch (error) {
+    res.status(502).json({ error: (error as Error).message });
+  }
+});
+
 app.post("/api/alerts/:eventId/ack", requireUser, async (req, res) => {
   const eventId = z.coerce.number().int().positive().safeParse(req.params.eventId);
   if (!eventId.success) return res.status(400).json({ error: "Invalid eventId" });
@@ -113,6 +158,17 @@ app.post("/api/alerts/:eventId/ack", requireUser, async (req, res) => {
   }
 });
 
+app.get("/api/live", requireUser, async (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+  res.write(": connected\n\n");
+
+  addLiveClient(res);
+  req.on("close", () => removeLiveClient(res));
+});
+
 const socketUrl = `${config.traccarUrl.replace(/^http/, "ws")}/api/socket`;
 
 app.listen(config.port, "0.0.0.0", () => {
@@ -120,6 +176,7 @@ app.listen(config.port, "0.0.0.0", () => {
 });
 
 void connectTraccarSocket(traccar, socketUrl, async (message) => {
+  broadcastLive(message as LiveMessage);
   if (message.events?.length) {
     await alertStore.createFromEvents(message.events);
   }
