@@ -14,6 +14,18 @@ export function createAlertStore() {
   const supabase = createClient(config.supabaseUrl, config.supabaseServiceRoleKey);
 
   return {
+    async list(deviceIds?: number[]) {
+      let query = supabase
+        .from("alerts")
+        .select("*")
+        .order("event_time", { ascending: false })
+        .limit(200);
+      if (deviceIds) query = query.in("device_id", deviceIds);
+      const { data, error } = await query;
+      if (error) throw error;
+      return data || [];
+    },
+
     async createFromEvents(events: TraccarEvent[]) {
       if (!events.length) return [];
 
@@ -40,7 +52,20 @@ export function createAlertStore() {
       eventId: number,
       update: { status: "acknowledged" | "resolved"; notes?: string },
       userId: string,
+      allowedDeviceIds?: number[],
     ) {
+      let query = supabase
+        .from("alerts")
+        .select("device_id")
+        .eq("event_id", eventId)
+        .maybeSingle();
+      const existing = await query;
+      if (existing.error) throw existing.error;
+      if (!existing.data) throw new Error("Alerta não encontrado");
+      if (allowedDeviceIds && !allowedDeviceIds.includes(Number(existing.data.device_id))) {
+        throw new Error("Acesso negado ao veículo");
+      }
+
       const { data, error } = await supabase
         .from("alerts")
         .update({

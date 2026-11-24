@@ -17,4 +17,6 @@ export const config = {
   traccarPassword: required("TRACCAR_PASSWORD"),
   supabaseUrl: required("SUPABASE_URL").replace(/\/$/, ""),
   supabaseServiceRoleKey: required("SUPABASE_SERVICE_ROLE_KEY"),
+  notificationEmailWebhookUrl: process.env.NOTIFICATION_EMAIL_WEBHOOK_URL?.trim() || "",
+  notificationWhatsAppWebhookUrl: process.env.NOTIFICATION_WHATSAPP_WEBHOOK_URL?.trim() || "",
 };

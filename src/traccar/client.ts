@@ -28,6 +28,46 @@ export class TraccarClient {
     return response.json() as Promise<T>;
   }
 
+  async post<T>(path: string, body: unknown): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: "POST",
+      headers: {
+        ...this.headers(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      throw new Error(`Traccar ${response.status}: ${await response.text()}`);
+    }
+    return response.json() as Promise<T>;
+  }
+
+  async put<T>(path: string, body: unknown): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: "PUT",
+      headers: {
+        ...this.headers(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      throw new Error(`Traccar ${response.status}: ${await response.text()}`);
+    }
+    return response.json() as Promise<T>;
+  }
+
+  async delete(path: string): Promise<void> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: "DELETE",
+      headers: this.headers(),
+    });
+    if (!response.ok) {
+      throw new Error(`Traccar ${response.status}: ${await response.text()}`);
+    }
+  }
+
   async createSession(): Promise<string> {
     const body = new URLSearchParams({
       email: this.email,
