@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   canViewDevice,
+  filterLiveMessageForUser,
   filterAllowedDevices,
   isAdministrator,
 } from "../src/permissions.js";
@@ -39,5 +40,35 @@ test("device filtering preserves objects and assignments", () => {
   assert.deepEqual(
     filterAllowedDevices({ role: "owner", deviceIds: [] }, devices),
     devices,
+  );
+});
+
+test("live messages include only devices assigned to non-administrators", () => {
+  const message = {
+    devices: [{ id: 1 }, { id: 2 }, { name: "missing id" }],
+    positions: [{ deviceId: 1 }, { deviceId: 2 }, {}],
+    events: [{ deviceId: 1 }, { deviceId: 2 }, { deviceId: "2" }],
+  };
+
+  assert.deepEqual(
+    filterLiveMessageForUser({ role: "viewer", deviceIds: [2] }, message),
+    {
+      devices: [{ id: 2 }],
+      positions: [{ deviceId: 2 }],
+      events: [{ deviceId: 2 }],
+    },
+  );
+});
+
+test("live messages remain complete for administrators", () => {
+  const message = {
+    devices: [{ id: 1 }, { id: 2 }],
+    positions: [{ deviceId: 1 }, { deviceId: 2 }],
+    events: [{ deviceId: 1 }, { deviceId: 2 }],
+  };
+
+  assert.equal(
+    filterLiveMessageForUser({ role: "owner", deviceIds: [] }, message),
+    message,
   );
 });

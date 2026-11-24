@@ -5,12 +5,29 @@ import { z } from "zod";
 import { config } from "./config.js";
 import { requireRole, requireUser } from "./auth.js";
 import { canViewDevice, filterAllowedDevices } from "./permissions.js";
+import { getEngineStopSafetyError } from "./commands.js";
+import { AlertStoreError } from "./alert-status.js";
 import { TraccarClient } from "./traccar/client.js";
 import { connectTraccarSocket } from "./traccar/socket.js";
 import { createAlertStore } from "./supabase/alerts.js";
 import type { LiveMessage } from "./types.js";
-import { addLiveClient, broadcastLive, removeLiveClient } from "./live.js";
+import {
+  addLiveClient,
+  broadcastLive,
+  invalidateLiveClientsForUser,
+  removeLiveClient,
+} from "./live.js";
 import { createClient } from "@supabase/supabase-js";
+import {
+  sendNotificationWebhooks,
+  type NotificationEvent,
+} from "./notifications.js";
+import { getNotificationDeliveryFailureUpdate } from "./notification-delivery.js";
+import {
+  positionQuerySchema,
+  reportRangeQuerySchema,
+  summaryQuerySchema,
+} from "./report-queries.js";
 
 const app = express();
 app.disable("x-powered-by");
@@ -43,6 +60,9 @@ const supabaseAdmin = createClient(
   config.supabaseServiceRoleKey,
 );
 const reportCache = new Map<string, { expiresAt: number; value: unknown }>();
+const notificationDeliveryBatchSize = 25;
+const notificationDeliveryLeaseMs = 30_000;
+let notificationDeliveryWorkerRunning = false;
 
 function getCachedReport(key: string) {
   const cached = reportCache.get(key);
@@ -63,14 +83,12 @@ function reportCacheKey(path: string, params: Record<string, unknown>) {
   return `${path}:${JSON.stringify(params)}`;
 }
 
-async function createNotifications(events: Array<{
-  id: number;
-  type: string;
-  deviceId: number;
-  eventTime: string;
-}>) {
+async function createNotifications(events: NotificationEvent[]) {
   if (!events.length) return;
-  const rows = events.map((event) => ({
+  const uniqueEvents = Array.from(
+    new Map(events.map((event) => [event.id, event])).values(),
+  );
+  const rows = uniqueEvents.map((event) => ({
     event_id: event.id,
     device_id: event.deviceId,
     type: event.type,
@@ -85,39 +103,194 @@ async function createNotifications(events: Array<{
   }));
   const { error } = await supabaseAdmin
     .from("notifications")
-    .upsert(rows, { onConflict: "event_id" });
-  if (error) console.error("Notification write failed:", error.message);
+    .upsert(rows, { onConflict: "event_id", ignoreDuplicates: true });
+  if (error) throw error;
 
-  if (config.notificationEmailWebhookUrl) {
-    try {
-      await fetch(config.notificationEmailWebhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ events }),
-      });
-    } catch (error) {
-      console.error("Notification email webhook failed:", (error as Error).message);
-    }
-  }
+  const channels: Array<"email" | "whatsapp"> = [];
+  if (config.notificationEmailWebhookUrl) channels.push("email");
+  if (config.notificationWhatsAppWebhookUrl) channels.push("whatsapp");
+  if (!channels.length) return;
 
-  if (config.notificationWhatsAppWebhookUrl) {
-    try {
-      await fetch(config.notificationWhatsAppWebhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          channel: "whatsapp",
-          events: events.map((event) => ({
-            id: event.id,
-            type: event.type,
-            deviceId: event.deviceId,
-            eventTime: event.eventTime,
-          })),
-        }),
+  const deliveries = uniqueEvents.flatMap((event) =>
+    channels.map((channel) => ({ event_id: event.id, channel })),
+  );
+  const { error: deliveryError } = await supabaseAdmin
+    .from("notification_deliveries")
+    .upsert(deliveries, {
+      onConflict: "event_id,channel",
+      ignoreDuplicates: true,
+    });
+  if (deliveryError) throw deliveryError;
+
+  void processNotificationDeliveries();
+}
+
+async function updateDeliveryJob(
+  jobId: number,
+  update: Record<string, unknown>,
+) {
+  const { data, error } = await supabaseAdmin
+    .from("notification_deliveries")
+    .update(update)
+    .eq("id", jobId)
+    .eq("status", "processing")
+    .select("id")
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("Notification delivery lease was lost");
+}
+
+async function processNotificationDeliveries() {
+  if (notificationDeliveryWorkerRunning) return;
+  notificationDeliveryWorkerRunning = true;
+
+  try {
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const { error: recoveryError } = await supabaseAdmin
+      .from("notification_deliveries")
+      .update({
+        status: "pending",
+        lease_expires_at: null,
+        updated_at: nowIso,
+      })
+      .eq("status", "processing")
+      .lte("lease_expires_at", nowIso);
+    if (recoveryError) throw recoveryError;
+
+    const { data: jobs, error: jobsError } = await supabaseAdmin
+      .from("notification_deliveries")
+      .select("id, event_id, channel, attempts")
+      .eq("status", "pending")
+      .lte("next_attempt_at", nowIso)
+      .order("next_attempt_at", { ascending: true })
+      .limit(notificationDeliveryBatchSize);
+    if (jobsError) throw jobsError;
+    if (!jobs?.length) return;
+
+    const eventIds = Array.from(new Set(jobs.map((job) => Number(job.event_id))));
+    const { data: notificationRows, error: notificationsError } = await supabaseAdmin
+      .from("notifications")
+      .select("event_id, type, device_id, event_time")
+      .in("event_id", eventIds);
+    if (notificationsError) throw notificationsError;
+
+    const eventsById = new Map<number, NotificationEvent>(
+      (notificationRows || []).map((row) => [
+        Number(row.event_id),
+        {
+          id: Number(row.event_id),
+          type: row.type,
+          deviceId: Number(row.device_id),
+          eventTime: row.event_time,
+        },
+      ]),
+    );
+
+    for (const job of jobs) {
+      const claimTime = new Date();
+      const attempts = Number(job.attempts) + 1;
+      const { data: claimed, error: claimError } = await supabaseAdmin
+        .from("notification_deliveries")
+        .update({
+          status: "processing",
+          attempts,
+          last_attempt_at: claimTime.toISOString(),
+          lease_expires_at: new Date(
+            claimTime.getTime() + notificationDeliveryLeaseMs,
+          ).toISOString(),
+          updated_at: claimTime.toISOString(),
+        })
+        .eq("id", Number(job.id))
+        .eq("status", "pending")
+        .lte("next_attempt_at", claimTime.toISOString())
+        .select("id, event_id, channel")
+        .maybeSingle();
+      if (claimError) throw claimError;
+      if (!claimed) continue;
+
+      const jobId = Number(claimed.id);
+      const eventId = Number(claimed.event_id);
+      const channel = claimed.channel;
+      const event = eventsById.get(eventId);
+      if (!event) {
+        await updateDeliveryJob(jobId, {
+          status: "failed",
+          last_error: "notification_source_missing",
+          lease_expires_at: null,
+          updated_at: new Date().toISOString(),
+        });
+        console.error(
+          `Notification delivery failed permanently (${channel}, event ${eventId}): source missing`,
+        );
+        continue;
+      }
+
+      if (channel !== "email" && channel !== "whatsapp") {
+        await updateDeliveryJob(jobId, {
+          status: "failed",
+          last_error: "unsupported_channel",
+          lease_expires_at: null,
+          updated_at: new Date().toISOString(),
+        });
+        console.error(
+          `Notification delivery failed permanently (event ${eventId}): unsupported channel`,
+        );
+        continue;
+      }
+
+      const webhookUrl = channel === "email"
+        ? config.notificationEmailWebhookUrl
+        : config.notificationWhatsAppWebhookUrl;
+      if (!webhookUrl) {
+        await updateDeliveryJob(jobId, {
+          status: "failed",
+          last_error: "webhook_not_configured",
+          lease_expires_at: null,
+          updated_at: new Date().toISOString(),
+        });
+        console.error(
+          `Notification delivery failed permanently (${channel}, event ${eventId}): webhook not configured`,
+        );
+        continue;
+      }
+
+      const failures = await sendNotificationWebhooks([event], {
+        emailUrl: channel === "email" ? webhookUrl : "",
+        whatsappUrl: channel === "whatsapp" ? webhookUrl : "",
       });
-    } catch (error) {
-      console.error("WhatsApp notification webhook failed:", (error as Error).message);
+      const failure = failures[0];
+      if (failure) {
+        const errorMessage = failure.status
+          ? `${failure.reason}:http_${failure.status}`
+          : failure.reason;
+        const failedAt = new Date();
+        const update = getNotificationDeliveryFailureUpdate(
+          attempts,
+          failedAt,
+          errorMessage,
+        );
+        await updateDeliveryJob(jobId, update);
+        const outcome = update.status === "failed" ? "failed permanently" : "will retry";
+        console.error(
+          `Notification delivery ${outcome} (${channel}, event ${eventId}, attempt ${attempts}): ${errorMessage}`,
+        );
+        continue;
+      }
+
+      const deliveredAt = new Date().toISOString();
+      await updateDeliveryJob(jobId, {
+        status: "delivered",
+        delivered_at: deliveredAt,
+        lease_expires_at: null,
+        last_error: null,
+        updated_at: deliveredAt,
+      });
     }
+  } catch (error) {
+    console.error("Notification delivery worker failed:", (error as Error).message);
+  } finally {
+    notificationDeliveryWorkerRunning = false;
   }
 }
 
@@ -355,7 +528,7 @@ app.post("/api/geofences", requireUser, requireRole("developer", "owner"), async
       description: z.string().trim().max(500).optional(),
       area: z.string().trim().min(8).max(10000),
       calendarId: z.coerce.number().int().positive().optional(),
-      deviceIds: z.array(z.number().int().positive()).default([]),
+      deviceIds: z.array(z.number().int().positive()).min(1),
     })
     .safeParse(req.body);
   if (!body.success) return res.status(400).json(body.error.flatten());
@@ -372,11 +545,23 @@ app.post("/api/geofences", requireUser, requireRole("developer", "owner"), async
       },
     );
 
-    if (body.data.deviceIds.length) {
+    try {
       await traccar.post("/api/permissions", body.data.deviceIds.map((deviceId) => ({
         deviceId,
         geofenceId: geofence.id,
       })));
+    } catch {
+      try {
+        await traccar.delete(`/api/geofences/${geofence.id}`);
+      } catch (cleanupError) {
+        console.error("Geofence cleanup failed after assignment error:", cleanupError);
+        return res.status(502).json({
+          error: "A geocerca pode ter sido criada sem atribuição. Verifique a lista antes de tentar novamente.",
+        });
+      }
+      return res.status(502).json({
+        error: "Não foi possível atribuir a geocerca aos veículos; a criação foi revertida.",
+      });
     }
     await auditAction(
       "geofence_created",
@@ -393,7 +578,7 @@ app.post("/api/geofences", requireUser, requireRole("developer", "owner"), async
 
 app.delete("/api/geofences/:geofenceId", requireUser, requireRole("developer", "owner"), async (req, res) => {
   const parsed = z.coerce.number().int().positive().safeParse(req.params.geofenceId);
-  if (!parsed.success) return res.status(400).json({ error: "Geofence inválida" });
+  if (!parsed.success) return res.status(400).json({ error: "Geocerca inválida" });
   try {
     await traccar.delete(`/api/geofences/${parsed.data}`);
     await auditAction(
@@ -440,6 +625,24 @@ app.post("/api/devices/:deviceId/commands", requireUser, requireRole("developer"
   }
 
   try {
+    if (body.data.type === "engineStop") {
+      const now = new Date();
+      const positions = await traccar.get<Array<{
+        fixTime?: string;
+        speed?: number;
+        attributes?: Record<string, unknown>;
+      }>>("/api/positions", {
+        deviceId: deviceId.data,
+        from: new Date(now.getTime() - 10 * 60 * 1000).toISOString(),
+        to: now.toISOString(),
+      });
+      const latestPosition = positions
+        .filter((position) => Number.isFinite(Date.parse(position.fixTime || "")))
+        .sort((a, b) => Date.parse(b.fixTime || "") - Date.parse(a.fixTime || ""))[0] || null;
+      const safetyError = getEngineStopSafetyError(latestPosition, now.getTime());
+      if (safetyError) return res.status(409).json({ error: safetyError });
+    }
+
     const command = await traccar.post<{ id?: number } & Record<string, unknown>>(
       "/api/commands/send",
       {
@@ -467,14 +670,8 @@ app.post("/api/devices/:deviceId/commands", requireUser, requireRole("developer"
   }
 });
 
-const positionQuery = z.object({
-  deviceId: z.coerce.number().int().positive().optional(),
-  from: z.string().datetime().optional(),
-  to: z.string().datetime().optional(),
-});
-
 app.get("/api/positions", requireUser, async (req, res) => {
-  const parsed = positionQuery.safeParse(req.query);
+  const parsed = positionQuerySchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json(parsed.error.flatten());
   try {
     const appUser = res.locals.appUser;
@@ -493,14 +690,8 @@ app.get("/api/positions", requireUser, async (req, res) => {
   }
 });
 
-const routeQuery = z.object({
-  deviceId: z.coerce.number().int().positive(),
-  from: z.string().datetime(),
-  to: z.string().datetime(),
-});
-
 app.get("/api/reports/route", requireUser, async (req, res) => {
-  const parsed = routeQuery.safeParse(req.query);
+  const parsed = reportRangeQuerySchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json(parsed.error.flatten());
   if (!canViewDevice(res.locals.appUser, parsed.data.deviceId)) {
     return res.status(403).json({ error: "Acesso negado ao veículo" });
@@ -513,13 +704,7 @@ app.get("/api/reports/route", requireUser, async (req, res) => {
 });
 
 app.get("/api/events", requireUser, async (req, res) => {
-  const parsed = z
-    .object({
-      deviceId: z.coerce.number().int().positive(),
-      from: z.string().datetime(),
-      to: z.string().datetime(),
-    })
-    .safeParse(req.query);
+  const parsed = reportRangeQuerySchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json(parsed.error.flatten());
   if (!canViewDevice(res.locals.appUser, parsed.data.deviceId)) {
     return res.status(403).json({ error: "Acesso negado ao veículo" });
@@ -531,14 +716,8 @@ app.get("/api/events", requireUser, async (req, res) => {
   }
 });
 
-const reportQuery = z.object({
-  deviceId: z.coerce.number().int().positive(),
-  from: z.string().datetime(),
-  to: z.string().datetime(),
-});
-
 app.get("/api/reports/trips", requireUser, async (req, res) => {
-  const parsed = reportQuery.safeParse(req.query);
+  const parsed = reportRangeQuerySchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json(parsed.error.flatten());
   if (!canViewDevice(res.locals.appUser, parsed.data.deviceId)) {
     return res.status(403).json({ error: "Acesso negado ao veículo" });
@@ -560,7 +739,7 @@ app.get("/api/reports/trips", requireUser, async (req, res) => {
 });
 
 app.get("/api/reports/stops", requireUser, async (req, res) => {
-  const parsed = reportQuery.safeParse(req.query);
+  const parsed = reportRangeQuerySchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json(parsed.error.flatten());
   if (!canViewDevice(res.locals.appUser, parsed.data.deviceId)) {
     return res.status(403).json({ error: "Acesso negado ao veículo" });
@@ -582,14 +761,7 @@ app.get("/api/reports/stops", requireUser, async (req, res) => {
 });
 
 app.get("/api/reports/summary", requireUser, async (req, res) => {
-  const parsed = z
-    .object({
-      deviceId: z.coerce.number().int().positive(),
-      from: z.string().datetime(),
-      to: z.string().datetime(),
-      daily: z.coerce.boolean().optional(),
-    })
-    .safeParse(req.query);
+  const parsed = summaryQuerySchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json(parsed.error.flatten());
   if (!canViewDevice(res.locals.appUser, parsed.data.deviceId)) {
     return res.status(403).json({ error: "Acesso negado ao veículo" });
@@ -619,41 +791,44 @@ app.post(
   requireUser,
   requireRole("developer", "owner", "manager"),
   async (req, res) => {
-  const eventId = z.coerce.number().int().positive().safeParse(req.params.eventId);
-  if (!eventId.success) return res.status(400).json({ error: "Invalid eventId" });
-  const body = z
-    .object({
-      status: z.enum(["acknowledged", "resolved"]),
-      notes: z.string().max(2000).optional(),
-    })
-    .safeParse(req.body);
-  if (!body.success) return res.status(400).json(body.error.flatten());
+    const eventId = z.coerce.number().int().positive().safeParse(req.params.eventId);
+    if (!eventId.success) return res.status(400).json({ error: "Alerta inválido" });
+    const body = z
+      .object({
+        status: z.enum(["acknowledged", "resolved"]),
+        notes: z.string().max(2000).optional(),
+      })
+      .safeParse(req.body);
+    if (!body.success) return res.status(400).json(body.error.flatten());
 
-  try {
-    const appUser = res.locals.appUser;
-    const allowedDeviceIds =
-      appUser.role === "developer" || appUser.role === "owner"
-        ? undefined
-        : appUser.deviceIds;
-    res.json(
-      await alertStore.updateStatus(
+    try {
+      const appUser = res.locals.appUser;
+      const allowedDeviceIds =
+        appUser.role === "developer" || appUser.role === "owner"
+          ? undefined
+          : appUser.deviceIds;
+      const updatedAlert = await alertStore.updateStatus(
         eventId.data,
         body.data,
         res.locals.authUser.id,
         allowedDeviceIds,
-      ),
-    );
-    await auditAction(
-      `alert_${body.data.status}`,
-      "alert",
-      eventId.data,
-      res.locals.authUser.id,
-      { notes: body.data.notes || null },
-    );
-  } catch (error) {
-    res.status(500).json({ error: (error as Error).message });
-  }
-});
+      );
+      await auditAction(
+        `alert_${body.data.status}`,
+        "alert",
+        eventId.data,
+        res.locals.authUser.id,
+        { notes: body.data.notes || null },
+      );
+      res.json(updatedAlert);
+    } catch (error) {
+      if (error instanceof AlertStoreError) {
+        return res.status(error.statusCode).json({ error: error.message });
+      }
+      res.status(500).json({ error: (error as Error).message });
+    }
+  },
+);
 
 app.get("/api/audit", requireUser, requireRole("developer", "owner"), async (_req, res) => {
   try {
@@ -695,22 +870,30 @@ app.post("/api/notifications/:notificationId/read", requireUser, async (req, res
 
   try {
     const appUser = res.locals.appUser;
-    let query = supabaseAdmin
+    const existing = await supabaseAdmin
       .from("notifications")
-      .update({ status: "read" })
+      .select("device_id, status")
       .eq("id", notificationId.data)
-      .select("device_id")
       .maybeSingle();
-    const existing = await query;
     if (existing.error) throw existing.error;
     if (!existing.data) return res.status(404).json({ error: "Notificação não encontrada" });
-    if (
-      appUser.role !== "developer"
-      && appUser.role !== "owner"
-      && !appUser.deviceIds.includes(Number(existing.data.device_id))
-    ) {
+    const deviceId = Number(existing.data.device_id);
+    if (!canViewDevice(appUser, deviceId)) {
       return res.status(403).json({ error: "Acesso negado à notificação" });
     }
+
+    if (existing.data.status !== "read") {
+      const { data, error } = await supabaseAdmin
+        .from("notifications")
+        .update({ status: "read" })
+        .eq("id", notificationId.data)
+        .eq("device_id", deviceId)
+        .select("id")
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: "Notificação não encontrada" });
+    }
+
     res.json({ id: notificationId.data, status: "read" });
   } catch (error) {
     res.status(500).json({ error: (error as Error).message });
@@ -724,7 +907,7 @@ app.get("/api/live", requireUser, async (req, res) => {
   res.flushHeaders();
   res.write(": connected\n\n");
 
-  addLiveClient(res);
+  addLiveClient(res, res.locals.appUser);
   req.on("close", () => removeLiveClient(res));
 });
 
@@ -871,8 +1054,8 @@ app.put(
       return res.status(400).json({ error: "Dados de utilizador inválidos" });
     }
 
+    const userId = parsedUserId.data;
     try {
-      const userId = parsedUserId.data;
       const profileUpdate: Record<string, unknown> = {};
       if (body.data.displayName !== undefined) profileUpdate.display_name = body.data.displayName;
       if (body.data.role !== undefined) profileUpdate.role = body.data.role;
@@ -913,8 +1096,10 @@ app.put(
         res.locals.authUser.id,
         body.data,
       );
+      invalidateLiveClientsForUser(userId, body.data.disabled === true);
       res.json({ id: userId, ...body.data });
     } catch (error) {
+      invalidateLiveClientsForUser(userId, false);
       res.status(500).json({ error: (error as Error).message });
     }
   },
@@ -925,6 +1110,11 @@ const socketUrl = `${config.traccarUrl.replace(/^http/, "ws")}/api/socket`;
 app.listen(config.port, "0.0.0.0", () => {
   console.log(`Fleet API listening on port ${config.port}`);
 });
+
+void processNotificationDeliveries();
+setInterval(() => {
+  void processNotificationDeliveries();
+}, 15_000);
 
 void connectTraccarSocket(traccar, socketUrl, async (message) => {
   broadcastLive(message as LiveMessage);
