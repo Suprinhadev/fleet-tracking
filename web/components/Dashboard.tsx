@@ -27,6 +27,11 @@ import { browserSupabase } from "../lib/supabase";
 import { getEngineStopBlockReason } from "../lib/engine-stop";
 import { polygonAreaWkt } from "../lib/geofences";
 import {
+  getLivePositionStatus,
+  isValidCoordinates,
+  mergeLatestPositions,
+} from "../lib/position-state";
+import {
   normalizeTripReports,
   summarizeTripReports,
   type TripReport,
@@ -81,6 +86,17 @@ function getRoleLabel(role: string): string {
     default:
       return "Visualizador";
   }
+}
+
+function getInitials(name: string): string {
+  return name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => Array.from(part)[0] || "")
+    .join("")
+    .toUpperCase() || "U";
 }
 
 function VehicleTypeIcon({ type, size = 18 }: { type: VehicleType; size?: number }) {
@@ -210,7 +226,7 @@ function formatRelativeTime(dateText?: string) {
   if (!Number.isFinite(timestamp)) return "Sem dados recentes";
 
   const elapsedMinutes = Math.floor((Date.now() - timestamp) / 60000);
-  if (elapsedMinutes < 0) return "Agora";
+  if (elapsedMinutes < 0) return "Data futura";
   if (elapsedMinutes < 1) return "Agora";
   if (elapsedMinutes < 60) return `Há ${elapsedMinutes} min`;
 
@@ -317,9 +333,30 @@ export default function Dashboard() {
   const [editingUser, setEditingUser] = useState<FleetUser | null>(null);
   const [editingVehicle, setEditingVehicle] = useState<Device | null>(null);
   const tripSummary = useMemo(() => summarizeTripReports(trips), [trips]);
+  const positionsByDevice = useMemo(
+    () => new Map(positions.map((position) => [position.deviceId, position])),
+    [positions],
+  );
+  const profileName = accessRole && ![
+    "Carregando",
+    "Não disponível",
+    "Não provisionado",
+  ].includes(accessRole)
+    ? accessRole
+    : "Utilizador";
+  const profileRole = accessRoleCode
+    ? getRoleLabel(accessRoleCode)
+    : accessLoaded
+      ? "Perfil não disponível"
+      : "Carregando";
 
   function showFeedback(kind: "success" | "error" | "info", message: string) {
     setActionFeedback({ kind, message });
+  }
+
+  function navigateToSection(section: typeof activeSection) {
+    setActiveSection(section);
+    setSidebarOpen(false);
   }
 
   function clearSessionData() {
@@ -446,7 +483,16 @@ export default function Dashboard() {
         const deviceList = (await deviceResponse.json()) as Device[];
         const positionList = (await positionResponse.json()) as Position[];
         setDevices(deviceList);
-        setPositions(positionList);
+        const accessibleDeviceIds = new Set(deviceList.map((device) => device.id));
+        const accessiblePositions = positionList.filter((position) =>
+          accessibleDeviceIds.has(position.deviceId),
+        );
+        setPositions((current) =>
+          mergeLatestPositions(
+            current.filter((position) => accessibleDeviceIds.has(position.deviceId)),
+            accessiblePositions,
+          ),
+        );
         setDataWarning("");
         setSelectedDeviceId((current) => current || deviceList[0]?.id);
       } catch {
@@ -538,16 +584,9 @@ export default function Dashboard() {
             }
 
             if (message.positions?.length) {
-              setPositions((current) => {
-                const map = new Map(current.map((position) => [position.id, position]));
-                for (const position of message.positions || []) map.set(position.id, position);
-                return Array.from(map.values())
-                  .sort(
-                    (a, b) =>
-                      new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime(),
-                  )
-                  .slice(0, 100);
-              });
+              setPositions((current) =>
+                mergeLatestPositions(current, message.positions || []),
+              );
             }
 
             if (message.events?.length && "Notification" in window) {
@@ -1134,9 +1173,7 @@ export default function Dashboard() {
   ) {
     if (!supabase || !deviceId) return;
     if (type === "engineStop") {
-      const position = positions
-        .filter((item) => item.deviceId === deviceId)
-        .sort((a, b) => new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime())[0];
+      const position = positionsByDevice.get(deviceId);
       const blockReason = getEngineStopBlockReason(position);
       if (blockReason) {
         showFeedback("error", `Bloqueio cancelado: ${blockReason}`);
@@ -1417,36 +1454,33 @@ export default function Dashboard() {
     void loadAudit();
   }, [activeSection, sessionReady, supabase]);
 
-  const filteredDevices = devices.filter((device) => {
+  const searchedDevices = devices.filter((device) => {
     const matchesSearch =
       `${device.name} ${device.uniqueId || ""} ${device.category || ""} ${device.plate || ""} ${device.brand || ""} ${device.model || ""} ${device.ownerName || ""}`
         .toLowerCase()
         .includes(search.toLowerCase());
-    if (!matchesSearch) return false;
+    return matchesSearch;
+  });
+
+  const filteredDevices = searchedDevices.filter((device) => {
     if (vehicleStateFilter === "all") return true;
 
-    const position = positions
-      .filter((item) => item.deviceId === device.id)
-      .sort((a, b) => new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime())[0];
-    const age = position
-      ? (Date.now() - new Date(position.fixTime).getTime()) / 60000
-      : null;
+    const status = getLivePositionStatus(positionsByDevice.get(device.id));
     if (vehicleStateFilter === "offline") {
-      return !position || age === null || age < 0 || age > 10;
+      return status === "no-data" || status === "stale" || status === "unknown";
     }
     if (vehicleStateFilter === "moving") {
-      return Boolean(position && age !== null && age >= 0 && age <= 10 && position.speed > 1);
+      return status === "moving";
     }
-    return Boolean(position && age !== null && age >= 0 && age <= 10 && position.speed <= 1);
+    return status === "stationary";
   });
 
   const selectedDevice =
     devices.find((device) => device.id === selectedDeviceId) || devices[0];
 
-  const selectedPosition =
-    positions
-      .filter((position) => position.deviceId === selectedDevice?.id)
-      .sort((a, b) => new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime())[0];
+  const selectedPosition = selectedDevice
+    ? positionsByDevice.get(selectedDevice.id)
+    : undefined;
 
   if (!sessionReady) {
     return (
@@ -1498,14 +1532,19 @@ export default function Dashboard() {
     );
   }
 
-  const latitude = selectedPosition?.latitude || -25.867148888888888;
-  const longitude = selectedPosition?.longitude || 32.5478;
-  const speedKnots = selectedPosition?.speed ?? 0;
-  const positionAgeMinutes = selectedPosition
-    ? (Date.now() - new Date(selectedPosition.fixTime).getTime()) / 60000
-    : null;
+  const selectedPositionStatus = getLivePositionStatus(selectedPosition);
   const hasRecentPosition =
-    positionAgeMinutes !== null && positionAgeMinutes >= 0 && positionAgeMinutes <= 10;
+    selectedPositionStatus === "moving" || selectedPositionStatus === "stationary";
+  const hasValidCoordinates = Boolean(
+    selectedPosition &&
+      isValidCoordinates(selectedPosition.latitude, selectedPosition.longitude),
+  );
+  const latitude = hasValidCoordinates && selectedPosition
+    ? selectedPosition.latitude
+    : -25.867148888888888;
+  const longitude = hasValidCoordinates && selectedPosition
+    ? selectedPosition.longitude
+    : 32.5478;
   const currentSpeedKmh = selectedPosition &&
       hasRecentPosition &&
       Number.isFinite(selectedPosition.speed) &&
@@ -1513,7 +1552,7 @@ export default function Dashboard() {
     ? knotsToKilometersPerHour(selectedPosition.speed)
     : null;
   const engineStopBlockReason = getEngineStopBlockReason(selectedPosition);
-  const isMoving = hasRecentPosition && speedKnots > 1;
+  const isMoving = selectedPositionStatus === "moving";
   const rssi = selectedPosition?.attributes?.rssi;
   const ignition = selectedPosition?.attributes?.ignition;
   const batteryLevel = selectedPosition?.attributes?.batteryLevel;
@@ -1522,13 +1561,15 @@ export default function Dashboard() {
   const totalDistance = selectedPosition?.attributes?.totalDistance;
   const totalDistanceKm =
     typeof totalDistance === "number" ? totalDistance / 1000 : null;
-  const movementLabel = !selectedPosition
-    ? "Sem dados"
-    : !hasRecentPosition
-      ? formatRelativeTime(selectedPosition.fixTime)
-      : isMoving
-        ? "Em movimento"
-        : "Parado";
+  const movementLabel = selectedPositionStatus === "moving"
+    ? "Em movimento"
+    : selectedPositionStatus === "stationary"
+      ? "Parado"
+      : selectedPositionStatus === "stale"
+        ? `Última posição · ${formatRelativeTime(selectedPosition?.fixTime)}`
+        : selectedPositionStatus === "unknown"
+          ? "Estado desconhecido"
+          : "Sem dados GPS";
   const geofenceDraftArea = geofenceDraftMode === "circle"
     ? geofenceDraftCenter
       ? `CIRCLE (${geofenceDraftCenter[0].toFixed(6)},${geofenceDraftCenter[1].toFixed(6)},${geofenceDraftRadius})`
@@ -1546,7 +1587,11 @@ export default function Dashboard() {
 
   return (
     <div className="app-shell">
-      <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
+      <aside
+        id="fleet-sidebar"
+        className={`sidebar ${sidebarOpen ? "open" : ""}`}
+        aria-label="Navegação principal"
+      >
         <div className="sidebar-head">
           <div className="brand-logo">
             <img
@@ -1555,38 +1600,43 @@ export default function Dashboard() {
               className="brand-logo-image"
             />
           </div>
-          <button className="icon-button close-sidebar" onClick={() => setSidebarOpen(false)}>
+          <button
+            type="button"
+            className="icon-button close-sidebar"
+            aria-label="Fechar menu"
+            onClick={() => setSidebarOpen(false)}
+          >
             <X size={18} />
           </button>
         </div>
         <nav>
           <button
             className={`nav-item ${activeSection === "map" ? "active" : ""}`}
-            onClick={() => setActiveSection("map")}
+            onClick={() => navigateToSection("map")}
           >
             <MapPinned size={18} />Mapa
           </button>
           <button
             className={`nav-item ${activeSection === "vehicles" ? "active" : ""}`}
-            onClick={() => setActiveSection("vehicles")}
+            onClick={() => navigateToSection("vehicles")}
           >
             <Navigation size={18} />Veículos
           </button>
           <button
             className={`nav-item ${activeSection === "trips" ? "active" : ""}`}
-            onClick={() => setActiveSection("trips")}
+            onClick={() => navigateToSection("trips")}
           >
             <Activity size={18} />Viagens
           </button>
           <button
             className={`nav-item ${activeSection === "alerts" ? "active" : ""}`}
-            onClick={() => setActiveSection("alerts")}
+            onClick={() => navigateToSection("alerts")}
           >
             <CircleGauge size={18} />Alertas
           </button>
           <button
             className={`nav-item ${activeSection === "users" ? "active" : ""}`}
-            onClick={() => setActiveSection("users")}
+            onClick={() => navigateToSection("users")}
           >
             <Users size={18} />Utilizadores
           </button>
@@ -1594,7 +1644,7 @@ export default function Dashboard() {
             className={`nav-item ${activeSection === "geofences" ? "active" : ""}`}
             onClick={() => {
               setGeofenceMapCenter([latitude, longitude]);
-              setActiveSection("geofences");
+              navigateToSection("geofences");
             }}
           >
             <MapPinned size={18} />Geocercas
@@ -1602,7 +1652,7 @@ export default function Dashboard() {
           {(accessRoleCode === "developer" || accessRoleCode === "owner") && (
             <button
               className={`nav-item ${activeSection === "audit" ? "active" : ""}`}
-              onClick={() => setActiveSection("audit")}
+              onClick={() => navigateToSection("audit")}
             >
               <ShieldCheck size={18} />Auditoria
             </button>
@@ -1615,17 +1665,27 @@ export default function Dashboard() {
 
       <main className="main-area">
         <header className="topbar">
-          <button className="icon-button menu-button" onClick={() => setSidebarOpen(true)}>
+          <button
+            type="button"
+            className="icon-button menu-button"
+            aria-label="Abrir menu"
+            aria-expanded={sidebarOpen}
+            aria-controls="fleet-sidebar"
+            onClick={() => setSidebarOpen((open) => !open)}
+          >
             <Menu size={20} />
           </button>
-          <div className="search-box">
-            <Search size={17} />
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Pesquisar por nome, matrícula, modelo ou IMEI"
-            />
-          </div>
+          {(activeSection === "map" || activeSection === "vehicles") && (
+            <label className="search-box">
+              <Search size={17} aria-hidden="true" />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                aria-label="Pesquisar veículos"
+                placeholder="Pesquisar veículos por nome, matrícula, modelo ou IMEI"
+              />
+            </label>
+          )}
           <div className="notification-wrap" ref={notificationWrapRef}>
             <button
               className="icon-button notification-button"
@@ -1669,14 +1729,13 @@ export default function Dashboard() {
               </div>
             )}
           </div>
-          <button className="profile-button">
-            <div className="avatar">AM</div>
+          <div className="profile-button">
+            <div className="avatar" aria-hidden="true">{getInitials(profileName)}</div>
             <div>
-              <strong>Administrador</strong>
-              <span>Gestão da frota</span>
+              <strong>{profileName}</strong>
+              <span>{profileRole}</span>
             </div>
-            <ChevronDown size={15} />
-          </button>
+          </div>
         </header>
 
         <section className="content">
@@ -1699,9 +1758,13 @@ export default function Dashboard() {
                             : "Auditoria"}
               </h1>
             </div>
-            <div className="live-status">
+            <div
+              className="live-status"
+              title="Estado da ligação entre esta página e a API; não confirma a comunicação GPS do veículo."
+              aria-label={`Ligação da API: ${dataWarning || (liveConnected ? "ligada" : "por consulta")}`}
+            >
               <span className={liveConnected ? "" : "offline"} />
-              {dataWarning || (liveConnected ? "Atualização ao vivo" : "Atualização por consulta")}
+              {dataWarning || (liveConnected ? "API ligada" : "API por consulta")}
             </div>
           </div>
 
@@ -1733,42 +1796,25 @@ export default function Dashboard() {
                 <div>
                   <span>Em movimento</span>
                   <strong>
-                    {devices.filter((device) => {
-                      const position = positions
-                        .filter((item) => item.deviceId === device.id)
-                        .sort((a, b) => new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime())[0];
-                      const age = position
-                        ? (Date.now() - new Date(position.fixTime).getTime()) / 60000
-                        : null;
-                      return Boolean(position && age !== null && age >= 0 && age <= 10 && position.speed > 1);
-                    }).length}
+                    {devices.filter((device) =>
+                      getLivePositionStatus(positionsByDevice.get(device.id)) === "moving",
+                    ).length}
                   </strong>
                 </div>
               </article>
               <article>
                 <div className="metric-icon amber"><CircleGauge size={18} /></div>
-                <div><span>Parados</span><strong>{devices.filter((device) => {
-                  const position = positions
-                    .filter((item) => item.deviceId === device.id)
-                    .sort((a, b) => new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime())[0];
-                  const age = position
-                    ? (Date.now() - new Date(position.fixTime).getTime()) / 60000
-                    : null;
-                  return Boolean(position && age !== null && age >= 0 && age <= 10 && position.speed <= 1);
-                }).length}</strong></div>
+                <div><span>Parados</span><strong>{devices.filter((device) =>
+                  getLivePositionStatus(positionsByDevice.get(device.id)) === "stationary",
+                ).length}</strong></div>
               </article>
               <article>
                 <div className="metric-icon navy"><ShieldCheck size={18} /></div>
                 <div>
-                  <span>Sem dados recentes</span>
+                  <span>Sem estado GPS fiável</span>
                   <strong>{devices.filter((device) => {
-                    const position = positions
-                      .filter((item) => item.deviceId === device.id)
-                      .sort((a, b) => new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime())[0];
-                    const age = position
-                      ? (Date.now() - new Date(position.fixTime).getTime()) / 60000
-                      : null;
-                    return !position || age === null || age < 0 || age > 10;
+                    const status = getLivePositionStatus(positionsByDevice.get(device.id));
+                    return status === "no-data" || status === "stale" || status === "unknown";
                   }).length}</strong>
                 </div>
               </article>
@@ -1862,7 +1908,7 @@ export default function Dashboard() {
               </article>
               <article>
                 <div className="metric-icon navy"><Users size={18} /></div>
-                <div><span>Papel atual</span><strong>{accessLoaded ? accessRole : "Carregando"}</strong></div>
+                <div><span>Papel atual</span><strong>{profileRole}</strong></div>
               </article>
             </div>
           ) : activeSection === "geofences" ? (
@@ -1896,7 +1942,7 @@ export default function Dashboard() {
               </article>
               <article>
                 <div className="metric-icon amber"><Users size={18} /></div>
-                <div><span>Responsável</span><strong>{accessLoaded ? accessRole : "Carregando"}</strong></div>
+                <div><span>Responsável</span><strong>{profileName}</strong></div>
               </article>
               <article>
                 <div className="metric-icon navy"><ShieldCheck size={18} /></div>
@@ -1910,7 +1956,7 @@ export default function Dashboard() {
               <div className="vehicles-toolbar">
                 <div>
                   <strong>Frota registada</strong>
-                  <span>{filteredDevices.length} veículo{filteredDevices.length === 1 ? "" : "s"} exibido{filteredDevices.length === 1 ? "" : "s"}</span>
+                  <span>{searchedDevices.length} veículo{searchedDevices.length === 1 ? "" : "s"} exibido{searchedDevices.length === 1 ? "" : "s"}</span>
                 </div>
                 {(accessRoleCode === "developer" || accessRoleCode === "owner") && (
                     <button type="button" className="add-vehicle-button" onClick={() => {
@@ -1921,7 +1967,7 @@ export default function Dashboard() {
                   </button>
                 )}
               </div>
-              {filteredDevices.length === 0 ? (
+              {searchedDevices.length === 0 ? (
                 <div className="section-placeholder">
                   <Navigation size={28} />
                   <h2>Sem veículos</h2>
@@ -1929,7 +1975,7 @@ export default function Dashboard() {
                 </div>
               ) : (
                 <div className="vehicle-table">
-                  {filteredDevices.map((device) => (
+                  {searchedDevices.map((device) => (
                     <article className="vehicle-row" key={device.id}>
                       <div className="vehicle-row-icon">
                         <VehicleTypeIcon type={getVehicleType(device)} />
@@ -2139,12 +2185,17 @@ export default function Dashboard() {
                   </div>
                 )}
                 <TrackerMap
-                  latitude={selectedPosition?.latitude || latitude}
-                  longitude={selectedPosition?.longitude || longitude}
+                  latitude={selectedTrip && tripRoute.length
+                    ? tripRoute[0][0]
+                    : latitude}
+                  longitude={selectedTrip && tripRoute.length
+                    ? tripRoute[0][1]
+                    : longitude}
                   name={selectedTrip ? selectedDevice?.name || "Veículo" : "Viagem"}
                   route={tripRoute}
                   course={selectedPosition?.course}
                   state={isMoving ? "moving" : "static"}
+                  showVehicleMarker={!selectedTrip && hasValidCoordinates}
                 />
               </section>
             </div>
@@ -2467,37 +2518,56 @@ export default function Dashboard() {
             <section className="map-panel">
               <div className="panel-heading">
                 <div>
-                  <p>Localização em tempo real</p>
+                  <p>
+                    {hasValidCoordinates
+                      ? selectedPositionStatus === "stale"
+                        ? "Última localização recebida"
+                        : "Localização GPS recente"
+                      : selectedPosition
+                        ? "Coordenadas GPS inválidas"
+                        : "À espera de sinal GPS"}
+                  </p>
                   <h2>{selectedDevice?.name || "Nenhum veículo"}</h2>
                 </div>
                 <span
                   className={
-                    !selectedPosition
-                      ? "status unknown"
-                      : !hasRecentPosition
-                        ? "status unknown"
-                        : isMoving
-                          ? "status moving"
-                          : "status parked"
+                    selectedPositionStatus === "moving"
+                      ? "status moving"
+                      : selectedPositionStatus === "stationary"
+                        ? "status parked"
+                        : "status unknown"
                   }
                 >
                   {movementLabel}
                 </span>
               </div>
-              <TrackerMap
-                latitude={latitude}
-                longitude={longitude}
-                name={selectedDevice?.name || "Veículo"}
-                route={tripRoute}
-                course={selectedPosition?.course}
-                state={
-                  !selectedPosition || !hasRecentPosition
-                    ? "offline"
-                    : isMoving
+              {hasValidCoordinates ? (
+                <TrackerMap
+                  latitude={latitude}
+                  longitude={longitude}
+                  name={selectedDevice?.name || "Veículo"}
+                  course={selectedPosition?.course}
+                  state={
+                    selectedPositionStatus === "moving"
                       ? "moving"
-                      : "static"
-                }
-              />
+                      : selectedPositionStatus === "stationary"
+                        ? "static"
+                        : "offline"
+                  }
+                />
+              ) : (
+                <div className="map-no-position" role="status">
+                  <MapPinned size={25} aria-hidden="true" />
+                  <strong>
+                    {selectedPosition
+                      ? "Não é possível mostrar esta posição"
+                      : "Ainda não há uma posição GPS para este veículo"}
+                  </strong>
+                  <span>
+                    A ligação à API não confirma que o rastreador esteja a enviar dados.
+                  </span>
+                </div>
+              )}
             </section>
 
             <aside className="fleet-panel">
@@ -2537,7 +2607,7 @@ export default function Dashboard() {
                   <option value="all">Todos os estados</option>
                   <option value="moving">Em movimento</option>
                   <option value="parked">Parados</option>
-                  <option value="offline">Sem dados recentes</option>
+                  <option value="offline">Sem estado GPS fiável</option>
                 </select>
               </div>
               <div className="device-list">
@@ -2546,14 +2616,11 @@ export default function Dashboard() {
                 )}
                 {filteredDevices.map((device) => (
                   (() => {
-                    const position = positions
-                      .filter((item) => item.deviceId === device.id)
-                      .sort((a, b) => new Date(b.fixTime).getTime() - new Date(a.fixTime).getTime())[0];
-                    const age = position
-                      ? (Date.now() - new Date(position.fixTime).getTime()) / 60000
-                      : null;
-                    const deviceRecent = Boolean(position && age !== null && age >= 0 && age <= 10);
-                    const deviceMoving = Boolean(deviceRecent && position && position.speed > 1);
+                    const position = positionsByDevice.get(device.id);
+                    const positionStatus = getLivePositionStatus(position);
+                    const deviceRecent =
+                      positionStatus === "moving" || positionStatus === "stationary";
+                    const deviceMoving = positionStatus === "moving";
                     const deviceSpeedKmh = deviceRecent && position &&
                         Number.isFinite(position.speed) && position.speed >= 0
                       ? knotsToKilometersPerHour(position.speed)
@@ -2561,11 +2628,15 @@ export default function Dashboard() {
                     const stateClass = deviceRecent
                       ? deviceMoving ? "state-moving" : "state-static"
                       : "state-offline";
-                    const stateLabel = deviceRecent
-                      ? deviceMoving ? "Em movimento" : "Parado"
-                      : position
-                        ? formatRelativeTime(position.fixTime)
-                        : "Sem dados recentes";
+                    const stateLabel = positionStatus === "moving"
+                      ? "Em movimento"
+                      : positionStatus === "stationary"
+                        ? "Parado"
+                        : positionStatus === "stale"
+                          ? `Último GPS · ${formatRelativeTime(position?.fixTime)}`
+                          : positionStatus === "unknown"
+                            ? "Estado GPS desconhecido"
+                            : "Sem dados recentes";
 
                     return (
                       <button
@@ -2585,7 +2656,9 @@ export default function Dashboard() {
                             className="device-speed-value"
                             title={
                               deviceSpeedKmh === null
-                                ? "Velocidade indisponível: sem posição GPS ou com mais de 10 minutos."
+                                ? positionStatus === "stale"
+                                  ? "Velocidade não apresentada: última posição com mais de 10 minutos."
+                                  : "Velocidade não apresentada: sem dados GPS válidos."
                                 : "Velocidade GPS atual"
                             }
                           >
@@ -2608,6 +2681,15 @@ export default function Dashboard() {
               )}
               {!fleetCollapsed && selectedDevice && (
                 <div className="device-details">
+                  {!hasRecentPosition && (
+                    <div className="device-data-warning" role="status">
+                      {selectedPositionStatus === "stale"
+                        ? `A última posição recebida foi ${formatRelativeTime(selectedPosition?.fixTime)}; estes dados não representam o estado atual do veículo.`
+                        : selectedPositionStatus === "unknown"
+                          ? "A velocidade GPS recebida é inválida; o estado atual do veículo não pode ser confirmado."
+                          : "Ainda não foi recebida uma posição GPS deste veículo."}
+                    </div>
+                  )}
                   <div>
                     <span>
                       Velocidade GPS
@@ -2628,12 +2710,16 @@ export default function Dashboard() {
                   </div>
                   <div>
                     <span>Sinal</span>
-                    <strong>{typeof rssi === "number" ? String(rssi) : "Não disponível"}</strong>
+                    <strong>
+                      {hasRecentPosition && typeof rssi === "number"
+                        ? String(rssi)
+                        : "Não disponível"}
+                    </strong>
                   </div>
                   <div>
                     <span>Ignição</span>
                     <strong>
-                      {typeof ignition === "boolean"
+                      {hasRecentPosition && typeof ignition === "boolean"
                         ? ignition ? "Ligada" : "Desligada"
                         : "Não disponível"}
                     </strong>
@@ -2641,19 +2727,23 @@ export default function Dashboard() {
                   <div>
                     <span>Bateria</span>
                     <strong>
-                      {typeof batteryLevel === "number"
+                      {hasRecentPosition && typeof batteryLevel === "number"
                         ? `${batteryLevel}%`
                         : "Não disponível"}
                     </strong>
                   </div>
                   <div>
                     <span>Satélites</span>
-                    <strong>{typeof satellites === "number" ? String(satellites) : "Não disponível"}</strong>
+                    <strong>
+                      {hasRecentPosition && typeof satellites === "number"
+                        ? String(satellites)
+                        : "Não disponível"}
+                    </strong>
                   </div>
                   <div>
-                    <span>Movimento Traccar</span>
+                    <span>Flag de movimento</span>
                     <strong>
-                      {typeof traccarMotion === "boolean"
+                      {hasRecentPosition && typeof traccarMotion === "boolean"
                         ? traccarMotion ? "Em movimento" : "Parado"
                         : "Não disponível"}
                     </strong>
@@ -2661,7 +2751,7 @@ export default function Dashboard() {
                   <div>
                     <span>Distância total</span>
                     <strong>
-                      {totalDistanceKm !== null
+                      {hasRecentPosition && totalDistanceKm !== null
                         ? `${totalDistanceKm.toFixed(2)} km`
                         : "Não disponível"}
                     </strong>

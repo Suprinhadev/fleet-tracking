@@ -1,11 +1,13 @@
+import {
+  MAX_POSITION_AGE_MS,
+  MAX_STATIONARY_SPEED_KNOTS,
+} from "./position-state";
+
 type PositionForEngineStop = {
   fixTime?: string;
   speed?: number;
   attributes?: Record<string, unknown>;
 };
-
-const MAX_POSITION_AGE_MS = 10 * 60 * 1000;
-const MAX_STATIONARY_SPEED_KNOTS = 0.5;
 
 export function getEngineStopBlockReason(
   position: PositionForEngineStop | null | undefined,

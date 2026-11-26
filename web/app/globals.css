@@ -164,6 +164,8 @@ button { cursor: pointer; }
   padding: 26px 18px 18px;
   background: #111224;
   color: white;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .sidebar-head {
@@ -221,8 +223,8 @@ button { cursor: pointer; }
 
 .nav-item.active {
   color: white;
-  background: linear-gradient(90deg, rgba(197,29,41,.95), rgba(197,29,41,.60));
-  box-shadow: 0 8px 20px rgba(197,29,41,.18);
+  background: rgba(255,255,255,.1);
+  box-shadow: inset 3px 0 0 var(--red);
 }
 
 .logout-button { margin-top: auto; color: #d9dbe3; }
@@ -397,6 +399,7 @@ button { cursor: pointer; }
   background: transparent;
   color: var(--ink);
   text-align: left;
+  cursor: default;
 }
 
 .profile-button .avatar {
@@ -412,7 +415,13 @@ button { cursor: pointer; }
 }
 
 .profile-button div:nth-child(2) { display: grid; }
-.profile-button strong { font-size: 12px; }
+.profile-button strong {
+  max-width: 130px;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .profile-button span { color: var(--muted); font-size: 10px; }
 
 .content { padding: 26px 28px 28px; }
@@ -619,6 +628,23 @@ button { cursor: pointer; }
 
 .tracker-map { height: calc(100% - 74px) !important; width: 100%; }
 
+.map-no-position {
+  height: calc(100% - 74px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+  background: #f8f9fb;
+}
+
+.map-no-position svg { color: #858895; }
+.map-no-position strong { color: var(--navy); font-size: 13px; }
+.map-no-position span { max-width: 320px; font-size: 11px; line-height: 1.5; }
+
 .vehicle-marker-inner {
   width: 44px;
   height: 44px;
@@ -700,7 +726,7 @@ button { cursor: pointer; }
 
 .device-details span {
   color: var(--muted);
-  font-size: 9px;
+  font-size: 10px;
   text-transform: uppercase;
   letter-spacing: .06em;
 }
@@ -712,7 +738,18 @@ button { cursor: pointer; }
 
 .device-details small {
   color: var(--muted);
-  font-size: 9px;
+  font-size: 10px;
+}
+
+.device-details .device-data-warning {
+  grid-column: 1 / -1;
+  min-height: 0;
+  display: block;
+  padding: 9px 10px;
+  background: #fff8e8;
+  color: #765513;
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 .engine-stop-status {
@@ -837,7 +874,7 @@ button { cursor: pointer; }
   font-weight: 800;
 }
 
-.device-speed small { color: #9a9ca5; font-size: 8px; }
+.device-speed small { color: #9a9ca5; font-size: 10px; }
 
 .trips-layout {
   height: calc(100vh - 258px);
@@ -1864,7 +1901,7 @@ button { cursor: pointer; }
   .content { padding: 18px 14px; }
   .page-heading { align-items: center; }
   .page-heading h1 { font-size: 24px; }
-  .live-status { font-size: 0; }
+  .live-status { font-size: 10px; }
   .live-status span { width: 9px; height: 9px; }
 
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1899,4 +1936,9 @@ button { cursor: pointer; }
   .vehicle-row { grid-template-columns: 42px minmax(0, 1fr) auto; }
   .vehicle-row-field { display: none; }
   .vehicle-row-actions { grid-column: 3; }
+}
+
+@media (max-width: 380px) {
+  .page-heading { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .live-status { align-self: flex-end; }
 }
