@@ -29,6 +29,26 @@ test("rejects malformed or timezone-free report timestamps", () => {
   );
 });
 
+test("rejects negative device IDs and malformed position query values", () => {
+  const validRange = {
+    from: "2026-11-24T00:00:00Z",
+    to: "2026-11-24T23:59:59Z",
+  };
+
+  assert.equal(
+    reportRangeQuerySchema.safeParse({ ...validRange, deviceId: "-7" }).success,
+    false,
+  );
+  assert.equal(positionQuerySchema.safeParse({ deviceId: "-7" }).success, false);
+  assert.equal(
+    positionQuerySchema.safeParse({
+      from: "invalid",
+      to: "",
+    }).success,
+    false,
+  );
+});
+
 test("parses the summary daily query as an explicit boolean", () => {
   const parsedFalse = summaryQuerySchema.safeParse({
     deviceId: "7",

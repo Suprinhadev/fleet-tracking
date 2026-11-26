@@ -20,6 +20,16 @@ test("assigned manager can view only assigned devices", () => {
   assert.equal(canViewDevice(appUser, 8), false);
 });
 
+test("one user cannot view another user's assigned device", () => {
+  const userA = { role: "manager", deviceIds: [7] };
+  const userB = { role: "manager", deviceIds: [8] };
+  const devices = [{ id: 7, name: "A" }, { id: 8, name: "B" }];
+
+  assert.equal(canViewDevice(userB, 7), false);
+  assert.deepEqual(filterAllowedDevices(userB, devices), [{ id: 8, name: "B" }]);
+  assert.equal(canViewDevice(userA, 8), false);
+});
+
 test("viewer cannot view devices outside assignments", () => {
   const appUser = { role: "viewer", deviceIds: [3] };
   assert.equal(canViewDevice(appUser, 3), true);
@@ -56,6 +66,23 @@ test("live messages include only devices assigned to non-administrators", () => 
       devices: [{ id: 2 }],
       positions: [{ deviceId: 2 }],
       events: [{ deviceId: 2 }],
+    },
+  );
+});
+
+test("live messages omit unassigned and malformed device identifiers", () => {
+  const message = {
+    devices: [{ id: 1 }, { id: Number.NaN }, {}],
+    positions: [{ deviceId: 1 }, { deviceId: "1" }, {}],
+    events: [{ deviceId: 1 }, { deviceId: Number.MAX_SAFE_INTEGER + 1 }],
+  };
+
+  assert.deepEqual(
+    filterLiveMessageForUser({ role: "viewer", deviceIds: [1] }, message),
+    {
+      devices: [{ id: 1 }],
+      positions: [{ deviceId: 1 }],
+      events: [{ deviceId: 1 }],
     },
   );
 });
